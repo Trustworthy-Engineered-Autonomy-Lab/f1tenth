@@ -1,156 +1,328 @@
 #!/usr/bin/env python3
+import math
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
-import numpy as np
-import concurrent.futures
-import time
+
 
 class ReactiveFollowGap(Node):
-    """
-    Implement Reactive Follow Gap on the car
-    """
-
     def __init__(self):
-        super().__init__('reactive_node')
+        super().__init__('reactive_follow_gap')
 
-        # Topics & Subs, Pubs
-        self.lidarscan_topic = '/scan'
-        self.drive_topic = '/drive'
+        # Topics
+        self.lidarscan_topic = "/scan"
+        self.drive_topic = "/drive"
 
-        # Subscribe to LIDAR
-        self.subscription = self.create_subscription(
-            LaserScan,
-            self.lidarscan_topic,
-            self.lidar_callback,
-            10
-        )
+        # Perception parameters
+        self.MAX_VALID_RANGE = 3.0              # cap far readings (m)
+        self.FREE_RANGE_THRESHOLD = 0.5         # min range to consider free (m)
+        self.BUBBLE_RADIUS = 100                # indices around closest obstacle
+        self.DISPARITY_THRESHOLD = 0.4          # adjacent range difference (m)
+        self.CAR_WIDTH = 0.30                   # vehicle width (m)
+        self.EXTEND_SCALE = 1.2                 # disparity inflation scaling
+        self.ROI_HALF_ANGLE = math.radians(90)  # consider only ±90° around front
 
-        # Publish to drive
-        self.publisher_ = self.create_publisher(
-            AckermannDriveStamped,
-            self.drive_topic,
-            10
-        )
+        # Control parameters
+        self.TURN_SIDE_SECTOR = math.radians(60) # forward sector to check on turning side
+        self.CLEARANCE_MARGIN = 0.35             # m; min side clearance while turning
+        self.MAX_STEER_DELTA = math.radians(4)   # rad per callback; steering rate limit
 
-        # Initialize the ReactiveFollowGap parameters
-        self.radians_per_elem = None
-        self.BUBBLE_RADIUS = 140
-        self.PREPROCESS_CONV_SIZE = 3
-        self.BEST_POINT_CONV_SIZE = 140
-        self.MAX_LIDAR_DIST = 3.0
-        self.STRAIGHTS_SPEED = 1.5
-        self.CORNERS_SPEED = 0.5
-        self.STRAIGHTS_STEERING_ANGLE = np.pi / 18 # 10 degrees
-        self.MAX_STEERING_ANGLE = 40.0 * (np.pi / 180)
+        # Inside/outside wall avoidance (symmetric)
+        self.LEFT_CLEARANCE_TARGET = 0.35         # m; desired min clearance on the left
+        self.RIGHT_CLEARANCE_TARGET = 0.35        # m; desired min clearance on the right
+        self.LEFT_SECTOR_ANGLE = math.radians(70)
+        self.RIGHT_SECTOR_ANGLE = math.radians(70)
+        self.LEFT_REPULSION_GAIN = 0.8            # rad per meter of deficit
+        self.RIGHT_REPULSION_GAIN = 0.8           # rad per meter of deficit
 
-    def preprocess_lidar(self, ranges):
-        """ Preprocess the LiDAR scan array."""
-        self.radians_per_elem = (2 * np.pi) / len(ranges)
-        # we won't use the LiDAR data from directly behind us
-        proc_ranges = np.array(ranges[135:-135])
-        # sets each value to the mean over a given window
-        proc_ranges = np.convolve(proc_ranges, np.ones(self.PREPROCESS_CONV_SIZE), 'same') / self.PREPROCESS_CONV_SIZE
-        proc_ranges = np.clip(proc_ranges, 0, self.MAX_LIDAR_DIST)
-        return proc_ranges
+        # Evasive maneuver (turn away from whichever side is too close)
+        self.EVASIVE_THRESHOLD = 0.25             # m; trigger evasive
+        self.EVASIVE_STEER = math.radians(18)     # rad; target turn in evasive
+        self.EVASIVE_SPEED = 0.25                 # m/s; low speed while evading
 
-    def find_max_gap(self, free_space_ranges):
-        """ Return the start index & end index of the max gap in free_space_ranges"""
-        # mask the bubble
-        masked = np.ma.masked_where(free_space_ranges == 0, free_space_ranges)
-        # get a slice for each contigous sequence of non-bubble data
-        slices = np.ma.notmasked_contiguous(masked)
-        max_len = slices[0].stop - slices[0].start
-        chosen_slice = slices[0]
-        # I think we will only ever have a maximum of 2 slices but will handle an
-        # indefinitely sized list for portablility
-        for sl in slices[1:]:
-            sl_len = sl.stop - sl.start
-            if sl_len > max_len:
-                max_len = sl_len
-                chosen_slice = sl
-        return chosen_slice.start, chosen_slice.stop
+        # State
+        self.processed_lidar = []
+        self.prev_steer = 0.0
 
-    def find_best_point(self, start_i, end_i, ranges):
-        """Start_i & end_i are start and end indices of max-gap range, respectively
-        Return index of best point in ranges
-        Naive: Choose the furthest point within ranges and go there
-        """
-        # do a sliding window average over the data in the max gap, this will
-        # help the car to avoid hitting corners
-        averaged_max_gap = np.convolve(ranges[start_i:end_i], np.ones(self.BEST_POINT_CONV_SIZE),
-                                       'same') / self.BEST_POINT_CONV_SIZE
-        print(averaged_max_gap)
-        return averaged_max_gap.argmax() + start_i
+        # ROS I/O
+        self.publisher_ = self.create_publisher(AckermannDriveStamped, self.drive_topic, 10)
+        self.subscription_ = self.create_subscription(LaserScan, self.lidarscan_topic, self.lidar_callback, 10)
 
-    def get_angle(self, range_index, range_len):
-        """ Get the angle of a particular element in the LiDAR data and transform it into an appropriate steering angle
-        """
-        lidar_angle = (range_index - (range_len / 2)) * self.radians_per_elem
-        steering_angle = lidar_angle / 2
+    # ---------------- Perception pipeline ----------------
+
+    def preprocess_lidar(self, scan_msg):
+        """Clamp far values and drop invalids."""
+        self.processed_lidar = []
+        rmin = max(0.0, scan_msg.range_min)
+        rmax = scan_msg.range_max if math.isfinite(scan_msg.range_max) else self.MAX_VALID_RANGE
+        cap = min(self.MAX_VALID_RANGE, rmax)
+        for r in scan_msg.ranges:
+            if not math.isfinite(r) or r <= rmin:
+                self.processed_lidar.append(0.0)
+            else:
+                self.processed_lidar.append(min(float(r), cap))
+
+    def apply_front_roi(self, scan_msg):
+        """Mask rays outside forward sector ±ROI_HALF_ANGLE."""
+        if not self.processed_lidar:
+            return
+        amin, ainc = scan_msg.angle_min, scan_msg.angle_increment
+        n = len(self.processed_lidar)
+        roi_min = -self.ROI_HALF_ANGLE
+        roi_max = +self.ROI_HALF_ANGLE
+
+        def angle_to_index(a):
+            return int(max(0, min(n - 1, math.floor((a - amin) / max(ainc, 1e-6)))))
+
+        start_i = angle_to_index(roi_min)
+        end_i = angle_to_index(roi_max)
+        if end_i <= start_i:
+            return
+        for i in range(0, start_i):
+            self.processed_lidar[i] = 0.0
+        for i in range(end_i + 1, n):
+            self.processed_lidar[i] = 0.0
+
+    def apply_safety_bubble(self):
+        """Zero-out indices around the closest obstacle."""
+        if not self.processed_lidar:
+            return
+        min_dist = float('inf')
+        closest_i = 0
+        for i, d in enumerate(self.processed_lidar):
+            if 0.01 < d < min_dist:
+                min_dist = d
+                closest_i = i
+        if not math.isfinite(min_dist) or min_dist == float('inf'):
+            return
+        lo = max(0, closest_i - self.BUBBLE_RADIUS)
+        hi = min(len(self.processed_lidar), closest_i + self.BUBBLE_RADIUS)
+        for i in range(lo, hi):
+            self.processed_lidar[i] = 0.0
+
+    def apply_disparity_extender(self, scan_msg):
+        """Inflate corners: mask wedges formed by large adjacent disparities."""
+        ranges = self.processed_lidar
+        if not ranges:
+            return
+        inc = scan_msg.angle_increment
+        n = len(ranges)
+        extended = ranges[:]  # copy
+
+        for i in range(n - 1):
+            r1, r2 = ranges[i], ranges[i + 1]
+            if r1 <= 0.0 or r2 <= 0.0:
+                continue
+            if abs(r1 - r2) > self.DISPARITY_THRESHOLD:
+                closer = min(r1, r2)
+                half_w = self.CAR_WIDTH / 2.0
+                ang = math.atan2(half_w, max(closer, 1e-3))  # rad
+                n_extend = max(1, int(self.EXTEND_SCALE * ang / max(inc, 1e-6)))
+
+                if r1 < r2:
+                    start = i + 1
+                    end = min(n, start + n_extend)
+                    for k in range(start, end):
+                        extended[k] = 0.0
+                else:
+                    start = max(0, i - n_extend + 1)
+                    end = i + 1
+                    for k in range(start, end):
+                        extended[k] = 0.0
+
+        self.processed_lidar = extended
+
+    def find_max_gap(self):
+        """Return (start_index, length) of longest run of free space."""
+        largest_starting_i = 0
+        longest_gap = 0
+        curr_gap = 0
+        for i in range(len(self.processed_lidar)):
+            if self.processed_lidar[i] < self.FREE_RANGE_THRESHOLD:
+                curr_gap = 0
+            else:
+                curr_gap += 1
+                if curr_gap > longest_gap:
+                    longest_gap = curr_gap
+                    largest_starting_i = i - curr_gap + 1
+        return largest_starting_i, longest_gap
+
+    def find_best_point(self, starting_i, gap_length):
+        """Choose farthest point within the gap (bias away from walls)."""
+        end_i = starting_i + gap_length
+        best_i = starting_i
+        best_r = -1.0
+        for i in range(starting_i, end_i):
+            r = self.processed_lidar[i]
+            if r > best_r:
+                best_r = r
+                best_i = i
+        return best_i
+
+    # ---------------- Steering shaping ----------------
+
+    def clamp_turn_by_clearance(self, steering_angle, scan_msg):
+        """Reduce steering magnitude if turning-side clearance is below margin."""
+        if not self.processed_lidar:
+            return steering_angle, 0.0
+        inc = scan_msg.angle_increment
+        i0 = int(round((0.0 - scan_msg.angle_min) / max(inc, 1e-6)))
+        i0 = max(0, min(len(self.processed_lidar) - 1, i0))
+
+        n_sector = max(1, int(self.TURN_SIDE_SECTOR / max(inc, 1e-6)))
+        if steering_angle >= 0.0:
+            start = i0
+            end = min(len(self.processed_lidar) - 1, i0 + n_sector)
+        else:
+            start = max(0, i0 - n_sector)
+            end = i0
+
+        sector_vals = [v for v in self.processed_lidar[start:end + 1] if v > 0.0]
+        min_clearance = min(sector_vals) if sector_vals else 0.0
+
+        if min_clearance < self.CLEARANCE_MARGIN and abs(steering_angle) > 1e-3:
+            scale = max(0.2, min_clearance / max(self.CLEARANCE_MARGIN, 1e-6))
+            steering_angle = math.copysign(scale * abs(steering_angle), steering_angle)
+
+        return steering_angle, min_clearance
+
+    def measure_side_clearances(self, scan_msg):
+        """Measure minimum clearances on left and right forward sectors."""
+        if not self.processed_lidar:
+            return 0.0, 0.0
+        inc = scan_msg.angle_increment
+        n = len(self.processed_lidar)
+        i0 = int(round((0.0 - scan_msg.angle_min) / max(inc, 1e-6)))
+        i0 = max(0, min(n - 1, i0))
+
+        n_left = max(1, int(self.LEFT_SECTOR_ANGLE / max(inc, 1e-6)))
+        n_right = max(1, int(self.RIGHT_SECTOR_ANGLE / max(inc, 1e-6)))
+
+        # Left sector: [i0, i0 + n_left]
+        l_start = i0
+        l_end = min(n - 1, i0 + n_left)
+        left_vals = [v for v in self.processed_lidar[l_start:l_end + 1] if v > 0.0]
+        left_min = min(left_vals) if left_vals else 0.0
+
+        # Right sector: [i0 - n_right, i0]
+        r_start = max(0, i0 - n_right)
+        r_end = i0
+        right_vals = [v for v in self.processed_lidar[r_start:r_end + 1] if v > 0.0]
+        right_min = min(right_vals) if right_vals else 0.0
+
+        return left_min, right_min
+
+    def apply_side_repulsion(self, steering_angle, left_min, right_min):
+        """Push away from close walls on either side."""
+        # Left too close -> steer right (negative)
+        left_deficit = max(0.0, self.LEFT_CLEARANCE_TARGET - left_min)
+        left_offset = self.LEFT_REPULSION_GAIN * left_deficit
+
+        # Right too close -> steer left (positive)
+        right_deficit = max(0.0, self.RIGHT_CLEARANCE_TARGET - right_min)
+        right_offset = self.RIGHT_REPULSION_GAIN * right_deficit
+
+        # Combine: rightward is negative, leftward is positive
+        steering_angle = steering_angle - left_offset + right_offset
         return steering_angle
 
-    def lidar_callback(self, data):
-        """
-        Process each LiDAR scan as per the Follow Gap algorithm
-        and publish an AckermannDriveStamped Message
-        """
-        ranges = data.ranges
-        proc_ranges = self.preprocess_lidar(ranges)
+    def apply_evasive_if_needed(self, steering_angle, left_min, right_min, min_clearance):
+        """If a side is below threshold, turn away from that side to avoid hitting the wall"""
+        left_bad = left_min < self.EVASIVE_THRESHOLD
+        right_bad = right_min < self.EVASIVE_THRESHOLD
 
-        # Find closest point to LiDAR
-        closest = proc_ranges.argmin()
-
-        # Eliminate all points inside 'bubble' (set them to zero)
-        min_index = closest - self.BUBBLE_RADIUS
-        max_index = closest + self.BUBBLE_RADIUS
-        if min_index < 0: min_index = 0
-        if max_index >= len(proc_ranges): max_index = len(proc_ranges) - 1
-        proc_ranges[min_index:max_index] = 0
-
-        # Find max length gap
-        gap_start, gap_end = self.find_max_gap(proc_ranges)
-
-        # Find the best point in the gap
-        best = self.find_best_point(gap_start, gap_end, proc_ranges)
-
-        # Publish Drive message
-        steering_angle = self.get_angle(best, len(proc_ranges))
-        
-        if abs(steering_angle) > self.STRAIGHTS_STEERING_ANGLE:
-            speed = self.CORNERS_SPEED
-            if steering_angle > self.MAX_STEERING_ANGLE:
-                steering_angle = -self.MAX_STEERING_ANGLE
+        if left_bad and right_bad:
+            # Turn away from the worse side
+            if left_min <= right_min:
+                return -self.EVASIVE_STEER, True  # steer right
             else:
-                steering_angle = self.MAX_STEERING_ANGLE
-        else:
-            speed = self.STRAIGHTS_SPEED
+                return +self.EVASIVE_STEER, True  # steer left
+        if left_bad:
+            return -self.EVASIVE_STEER, True
+        if right_bad:
+            return +self.EVASIVE_STEER, True
 
-        print('Steering angle in degrees: {}'.format((steering_angle / (np.pi / 2)) * 90))
+        # Turning-side clearance (min_clearance) still too low: turn away from current turn
+        if min_clearance < self.EVASIVE_THRESHOLD:
+            return (-self.EVASIVE_STEER if steering_angle >= 0.0 else +self.EVASIVE_STEER), True
 
-        # Publish the drive message
-        self.publish_drive(speed, steering_angle)
+        return steering_angle, False
 
-    def publish_drive(self, speed, steering_angle):
-        """
-        Publishes drive commands to the robot
-        """
+    def rate_limit_steering(self, steering_angle):
+        """Limit change per callback to avoid abrupt turn-ins or oscillations."""
+        delta = steering_angle - self.prev_steer
+        if abs(delta) > self.MAX_STEER_DELTA:
+            steering_angle = self.prev_steer + math.copysign(self.MAX_STEER_DELTA, delta)
+        self.prev_steer = steering_angle
+        return steering_angle
+
+    # ---------------- Main callback ----------------
+
+    def lidar_callback(self, scan_msg):
+        # 1) Perception
+        self.preprocess_lidar(scan_msg)
+        self.apply_front_roi(scan_msg)
+        self.apply_safety_bubble()
+        self.apply_disparity_extender(scan_msg)
+
+        # 2) Gap selection
+        gap_start, gap_len = self.find_max_gap()
         drive_msg = AckermannDriveStamped()
         drive_msg.header.stamp = self.get_clock().now().to_msg()
-        drive_msg.drive.steering_angle = steering_angle * 1.2
+
+        if gap_len == 0:
+            self.get_logger().warning("No gap found! Emergency stop.")
+            drive_msg.drive.steering_angle = 0.0
+            drive_msg.drive.speed = 0.0
+            self.publisher_.publish(drive_msg)
+            return
+
+        best_i = self.find_best_point(gap_start, gap_len)
+        steering_angle = scan_msg.angle_min + best_i * scan_msg.angle_increment
+
+        # 3) Side measurements and steering shaping
+        left_min, right_min = self.measure_side_clearances(scan_msg)
+        steering_angle = self.apply_side_repulsion(steering_angle, left_min, right_min)
+        steering_angle, min_clearance = self.clamp_turn_by_clearance(steering_angle, scan_msg)
+        steering_angle, evasive = self.apply_evasive_if_needed(steering_angle, left_min, right_min, min_clearance)
+        steering_angle = self.rate_limit_steering(steering_angle)
+
+        drive_msg.drive.steering_angle = steering_angle
+
+        # 4) Speed policy
+        steering_abs = abs(steering_angle)
+        target_range = self.processed_lidar[best_i] if 0 <= best_i < len(self.processed_lidar) else 0.0
+
+        if evasive:
+            speed = self.EVASIVE_SPEED
+        elif target_range < 0.20:  # hard stop only for an obstacle directly ahead
+            speed = 0.0
+        elif steering_abs < math.radians(10):
+            speed = 1.0 if target_range > 1.0 and min_clearance > 0.5 else 0.6
+        elif steering_abs < math.radians(20):
+            speed = 0.6 if target_range > 0.8 and min_clearance > 0.4 else 0.4
+        else:
+            speed = 0.3
+
         drive_msg.drive.speed = speed
         self.publisher_.publish(drive_msg)
 
+        self.get_logger().info(
+            f"steer={steering_angle:.3f} rad, speed={speed:.2f} m/s, min_clear={min_clearance:.2f} m, "
+            f"left_min={left_min:.2f} m, right_min={right_min:.2f} m, evasive={'Y' if evasive else 'N'}"
+        )
 
+# main
 def main(args=None):
     rclpy.init(args=args)
-    print("ReactiveFollowGap Initialized")
-    reactive_node = ReactiveFollowGap()
-    rclpy.spin(reactive_node)
-
-    reactive_node.destroy_node()
+    print("ReactiveFollowGap (Python) Initialized")
+    node = ReactiveFollowGap()
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
