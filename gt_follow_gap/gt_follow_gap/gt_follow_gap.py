@@ -15,6 +15,13 @@ class ReactiveFollowGap(Node):
         self.lidarscan_topic = "/scan"
         self.drive_topic = "/drive"
 
+        # Speed parameters
+        self.MAX_SPEED = 1.67                  # Top speed for straight driving with clear path
+        self.HIGH_SPEED = 1.2               # minor turns or limited clearance
+        self.MEDIUM_SPEED = 1             # caution speed, moderate turns or low clearance
+        self.DEF_LOW_SPEED = 0.8            # default else low speed
+        # evasive speed is defined in # Evasive Manuever section
+
         # Perception parameters
         self.MAX_VALID_RANGE = 3.0              # cap far readings (m)
         self.FREE_RANGE_THRESHOLD = 0.5         # min range to consider free (m)
@@ -30,17 +37,17 @@ class ReactiveFollowGap(Node):
         self.MAX_STEER_DELTA = math.radians(4)   # rad per callback; steering rate limit
 
         # Inside/outside wall avoidance (symmetric)
-        self.LEFT_CLEARANCE_TARGET = 0.35         # m; desired min clearance on the left
-        self.RIGHT_CLEARANCE_TARGET = 0.35        # m; desired min clearance on the right
+        self.LEFT_CLEARANCE_TARGET = 0.5          # m; desired min clearance on the left
+        self.RIGHT_CLEARANCE_TARGET = 0.5         # m; desired min clearance on the right
         self.LEFT_SECTOR_ANGLE = math.radians(70)
         self.RIGHT_SECTOR_ANGLE = math.radians(70)
         self.LEFT_REPULSION_GAIN = 0.8            # rad per meter of deficit
         self.RIGHT_REPULSION_GAIN = 0.8           # rad per meter of deficit
 
         # Evasive maneuver (turn away from whichever side is too close)
-        self.EVASIVE_THRESHOLD = 0.25             # m; trigger evasive
+        self.EVASIVE_THRESHOLD = 0.4             # m; trigger evasive
         self.EVASIVE_STEER = math.radians(18)     # rad; target turn in evasive
-        self.EVASIVE_SPEED = 0.25                 # m/s; low speed while evading
+        self.EVASIVE_SPEED = 0.6                 # m/s; low speed while evading
 
         # State
         self.processed_lidar = []
@@ -300,11 +307,11 @@ class ReactiveFollowGap(Node):
         elif target_range < 0.20:  # hard stop only for an obstacle directly ahead
             speed = 0.0
         elif steering_abs < math.radians(10):
-            speed = 1.0 if target_range > 1.0 and min_clearance > 0.5 else 0.6
+            speed = self.MAX_SPEED if target_range > 1.0 and min_clearance > 0.5 else self.HIGH_SPEED
         elif steering_abs < math.radians(20):
-            speed = 0.6 if target_range > 0.8 and min_clearance > 0.4 else 0.4
+            speed = self.HIGH_SPEED if target_range > 0.8 and min_clearance > 0.4 else self.MEDIUM_SPEED
         else:
-            speed = 0.3
+            speed = self.DEF_LOW_SPEED
 
         drive_msg.drive.speed = speed
         self.publisher_.publish(drive_msg)
